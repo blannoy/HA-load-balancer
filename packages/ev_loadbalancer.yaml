@@ -119,13 +119,16 @@ script:
       car_aware: "{{ state_attr('sensor.ev_load_balancer', 'car_aware') }}"
       phase_1: "{{ state_attr('sensor.ev_load_balancer_charger', 'phase_1_state') | default('1 Phase', true) }}"
       phase_3: "{{ state_attr('sensor.ev_load_balancer_charger', 'phase_3_state') | default('3 Phases', true) }}"
+      max_current: "{{ state_attr('sensor.ev_load_balancer_charger', 'max_current') | default(16, true) }}"
       min_current: >
         {% set charger_min_current = state_attr('sensor.ev_load_balancer_charger', 'min_current') %}
         {% set car_min_current = state_attr('sensor.ev_load_balancer_car', 'min_current') %}
         {{ [car_min_current if car_aware else charger_min_current, charger_min_current] | max }}
     sequence:
       - variables:
-          finalcurrent: "{{ 0 if current < min_current else current }}"
+          finalcurrent: >-
+            {{  min_current if current < min_current else max_current if current >
+            max_current else current }}
           phase: "{{ phase_3 if phase|int == 3 else phase_1 }}"
       # First handle any needed phase changes
       - if:
@@ -134,7 +137,7 @@ script:
               {{ has_value(state_attr('sensor.ev_load_balancer_charger','phases_output')) and
                  phase != states(state_attr('sensor.ev_load_balancer_charger','phases_output')) }}
         then:
-          # Step 1: Set current to 0 first (only when switching from 1 to 3 phases)
+                  # Step 1: Set current to 0 first (only when switching from 1 to 3 phases)
           - if:
               - condition: template
                 value_template: >
@@ -159,7 +162,7 @@ script:
                     - condition: template
                       value_template: >
                         {{ state_attr('sensor.ev_load_balancer_charger','current_input') | int == 0 or
-                           repeat.index >= max_delays }}
+                          repeat.index >= max_delays }}
           # Step 2: Change phases
           - alias: "Change phases"
             action: system_log.write
@@ -183,25 +186,35 @@ script:
                 - condition: template
                   value_template: >
                     {{ state_attr('sensor.ev_load_balancer_charger', 'phases_input') == phase or
-                       repeat.index >= max_delays }}
+                      repeat.index >= max_delays }}
       # After phase change or if no phase change needed, set the final current
       # Set the final current if needed
       - if:
           - condition: template
             value_template: "{{ has_value(state_attr('sensor.ev_load_balancer_charger','current_output')) }}"
           - condition: template
-            value_template: "{{ finalcurrent | int != states(state_attr('sensor.ev_load_balancer_charger','current_output')) | int }}"
+            value_template: "{{ has_value(state_attr('sensor.ev_load_balancer_car','actual_current')) }}"
+          - condition: template
+            value_template: "{{ finalcurrent | int != states(state_attr('sensor.ev_load_balancer_car','actual_current')) | int }}
         then:
           - action: system_log.write
             data:
               level: info
-              message: "[Pkg] Changing current from {{ state_attr('sensor.ev_load_balancer_charger', 'current_input') }} to {{ finalcurrent }}"
+              message: "[Pkg] Changing current from {{ states(state_attr('sensor.ev_load_balancer_car','actual_current'))  }} to {{ finalcurrent }}
           - action: number.set_value
             target:
               entity_id: "{{ state_attr('sensor.ev_load_balancer_charger','current_output') }}"
             data:
-              value: "{{ finalcurrent }}"
-          # Wait for current change to complete
+              value: "{{ max_current if car_aware else finalcurrent }}"
+#set car current 2 times in order to bypass not setting value for values below a minimum current (like Tesla)     
+          - repeat:
+              count: 2
+              sequence:
+                - action: number.set_value
+                  target:
+                    entity_id: "{{state_attr('sensor.ev_load_balancer_car','actual_current')}}"
+                  data:
+                    value: "{{ finalcurrent }}"
           - variables:
               max_delays: 30
           - repeat:
@@ -211,8 +224,8 @@ script:
               until:
                 - condition: template
                   value_template: >
-                    {{ state_attr('sensor.ev_load_balancer_charger','current_input') | int(99) == finalcurrent | int or
-                       repeat.index >= max_delays }}
+                    {{ states(state_attr('sensor.ev_load_balancer_car','actual_current')) | int(99) == finalcurrent | int or
+                      repeat.index >= max_delays }}
     description: Set the charger current and phase
     fields:
       phase:
@@ -229,7 +242,7 @@ script:
       current:
         selector:
           number:
-            min: 6
+            min: 2
             max: 16
             step: 1
         name: current
@@ -240,6 +253,7 @@ script:
 
 automation:
   - alias: EV Charging Load Balancer
+    initial_state: false
     id: load_balance_ev_charging
     description: "Dynamic load balancing for EV charging with optional car-aware power management"
 
@@ -270,7 +284,7 @@ automation:
           phase_1: "{{ state_attr('sensor.ev_load_balancer_charger', 'phase_1_state') | default('1 Phase', true) }}"
           phase_3: "{{ state_attr('sensor.ev_load_balancer_charger', 'phase_3_state') | default('3 Phases', true) }}"
           selected_mode: "{{ states('sensor.ev_load_balancer') }}"
-
+          min_current_3_phase: "{{ state_attr('sensor.ev_load_balancer_charger', 'min_current_3_phases') | default(5, true) }}"
           # Determine effective mode for Comfort mode
           effective_mode: >
             {% if selected_mode == 'Comfort' %}
@@ -359,12 +373,12 @@ automation:
               {{ 0 | int}}
             {% endif %}
 
-          phase_selection: "{{ 3 if available_power >= (nominal_voltage * min_current * 3) else 1 }}"
+          phase_selection: "{{ 3 if available_power >= (nominal_voltage * min_current_3_phases * 3) else 1 }}"
 
           current_limit: >
             {% set current = (available_power / (nominal_voltage * phase_selection)) | int %}
             {% if current < min_current %}
-              0
+              {{ min_current }}
             {% elif current > max_current %}
               {{ max_current }}
             {% else %}
@@ -425,7 +439,7 @@ automation:
           adjusted_current_limit: >
             {% set current = (adjusted_available_power_final / (nominal_voltage * adjusted_phase_selection)) | int %}
             {% if current | int < min_current %}
-              0
+              {{ min_current}}
             {% elif current | int > max_current %}
               {{ max_current }}
             {% else %}
@@ -442,6 +456,7 @@ automation:
                     state_attr('sensor.ev_load_balancer_charger','current_input'),
                     state_attr('sensor.ev_load_balancer_charger','active_power'),
                     state_attr('sensor.ev_load_balancer_charger','phases_input'),
+                    states(state_attr('sensor.ev_load_balancer_car','actual_current')),
                   ] %}
                   {{ base_sensors | select('in', ['unavailable', 'unknown', None, 'none', 'None', '']) | list | count > 0 }}
             sequence:
@@ -517,6 +532,7 @@ automation:
 
   - alias: Reset EV charger
     id: ev_load_balancer_ev_charger_reset
+    initial_state: false
     description: Reset charger when charger is disconnected
     triggers:
       - trigger: template
@@ -534,6 +550,7 @@ automation:
     mode: single
 
   - alias: Phase Switching Timer Control
+    initial_state: false
     id: ev_load_balancer_phase_switching_timer_control
     description: Start timer when switching from 3 phase to 1 phase in Limited or Solar mode
     triggers:
