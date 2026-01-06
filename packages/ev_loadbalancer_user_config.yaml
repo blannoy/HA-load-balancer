@@ -26,12 +26,15 @@ sensor:
     name: "Netto verbruik filter"
     entity_id: sensor.netto_verbruik_actual
     filters:
-      - filter: outlier
-        window_size: 4
-        radius: 500.0
-      - filter: lowpass
-        time_constant: 12
+      - filter: time_simple_moving_average
+        window_size: "00:03"
         precision: 2
+      # - filter: outlier
+      #   window_size: 4
+      #   radius: 500.0
+      # - filter: lowpass
+      #   time_constant: 12
+      #   precision: 2
 
 template:
   - sensor:
